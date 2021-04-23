@@ -6,11 +6,15 @@ use dns_message_parser::Dns;
 use etherparse::IpHeader;
 use etherparse::PacketHeaders;
 use eyre::{Result, WrapErr};
+#[cfg(not(windows))]
 use futures::StreamExt;
 use getopts::Options;
 use hex::encode;
+#[cfg(not(windows))]
 use pcap::stream::{PacketCodec, PacketStream};
-use pcap::{Active, Capture, Linktype, Packet};
+#[cfg(not(windows))]
+use pcap::Active;
+use pcap::{Capture, Device, Linktype, Packet};
 use std::collections::HashMap;
 use std::env;
 use std::net::IpAddr;
@@ -37,12 +41,71 @@ struct Opts {
 }
 
 #[derive(Clone)]
+struct Interface {
+    device: Device,
+    port: u16,
+}
+
+fn find_device_with_name(name: &str) -> Result<Option<Device>> {
+    let device = pcap::Device::list()?
+        .iter()
+        .filter(|x| x.name.eq(name))
+        .nth(0)
+        .map(|x| x.to_owned());
+
+    Ok(device)
+}
+
+impl Interface {
+    #[cfg(windows)]
+    fn from_default() -> Result<Interface> {
+        let device = pcap::Device::lookup().wrap_err("Cannot find any interface on your device")?;
+        // pcap doesn't return the device's desc in `lookup` method.
+        // Using unwrap is safe here since we have gotten the correct name.
+        let device = find_device_with_name(&device.name)?.unwrap();
+
+        Ok(Interface::from_device(device))
+    }
+
+    #[cfg(not(windows))]
+    fn from_any() -> Result<Interface> {
+        let device = find_device_with_name("any").wrap_err("Cannot find the interface `any`")?;
+        match device {
+            Some(dev) => Ok(Interface::from_device(dev)),
+            None => panic!("Cannot find the interface `any`"),
+        }
+    }
+
+    fn from_device(device: Device) -> Interface {
+        Interface { device, port: 53 }
+    }
+}
+
+#[derive(Clone)]
 enum Source {
-    Port(u16),
+    Interface(Interface),
     Filename(String),
 }
 
 impl Opts {
+    fn print_source(self: &Opts) {
+        match &self.source {
+            Source::Interface(iter) => {
+                let name = &iter.device.name;
+                let desc = iter
+                    .device
+                    .desc
+                    .as_ref()
+                    .map(|desc| format!("({})", desc))
+                    .unwrap_or(String::from(""));
+                let port = iter.port;
+                println!("Capturing from interface {}{} at port {}", name, desc, port)
+            }
+            Source::Filename(filename) => {
+                println!("Capturing from file {}", filename)
+            }
+        }
+    }
     fn print_header(self: &Opts) {
         if self.timestamp {
             println!(
@@ -80,11 +143,21 @@ impl Opts {
 async fn main() -> Result<()> {
     let map = Arc::new(Mutex::new(HashMap::new()));
     let opts = parse_args()?;
+    opts.print_source();
     opts.print_header();
+
     match opts.clone().source {
-        Source::Port(port) => {
-            let stream = capture_stream(opts, map.clone(), port)?;
-            capture_packets(stream).await;
+        Source::Interface(interface) => {
+            #[cfg(windows)]
+            {
+                capture_interface(interface, map, opts)?
+            }
+
+            #[cfg(not(windows))]
+            {
+                let stream = capture_stream(opts, map, interface)?;
+                capture_packets(stream).await;
+            }
         }
         Source::Filename(filename) => {
             capture_file(&opts, &filename)?;
@@ -106,6 +179,14 @@ fn parse_args() -> Result<Opts> {
         "print timestamp and elapsed time for each query",
     );
     opts.optflag("h", "help", "print this help menu");
+    opts.optopt(
+        "i",
+        "interface",
+        "capture packets from an interface",
+        "INTERFACE_NAME",
+    );
+    opts.optflag("l", "list", "list all interfaces");
+
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
         Err(f) => {
@@ -116,18 +197,43 @@ fn parse_args() -> Result<Opts> {
         print_usage(&program, opts);
         std::process::exit(0);
     }
+
+    if matches.opt_present("l") {
+        list_all_interfaces()?;
+        std::process::exit(0);
+    }
+
     let mut opts = Opts {
-        source: Source::Port(53),
+        #[cfg(windows)]
+        source: Source::Interface(Interface::from_default()?),
+        #[cfg(not(windows))]
+        source: Source::Interface(Interface::from_any()?),
         timestamp: matches.opt_present("t"),
     };
 
-    if let Some(filename) = matches.opt_str("f") {
-        opts.source = Source::Filename(filename.to_string());
-    } else if let Some(port_str) = matches.opt_str("p") {
-        match port_str.parse() {
-            Ok(port) => {
-                opts.source = Source::Port(port);
+    if let Some(interface_name) = matches.opt_str("i") {
+        match find_device_with_name(&interface_name)? {
+            Some(device) => {
+                opts.source = Source::Interface(Interface::from_device(device));
             }
+            None => {
+                eprintln!(
+                    "Cannot find an interface with the name `{}`",
+                    &interface_name
+                );
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(filename) = matches.opt_str("f") {
+        opts.source = Source::Filename(filename.to_string());
+    }
+    if let Some(port_str) = matches.opt_str("p") {
+        match port_str.parse() {
+            // set port to current interface config
+            Ok(port) => match &mut opts.source {
+                Source::Interface(iter) => iter.port = port,
+                _ => {}
+            },
             Err(_) => {
                 eprintln!("Invalid port number: {}", &port_str);
                 std::process::exit(1);
@@ -164,12 +270,13 @@ fn capture_file(opts: &Opts, filename: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn capture_stream(
     opts: Opts,
     map: Arc<Mutex<HashMap<u16, OrigPacket>>>,
-    port: u16,
+    interface: Interface,
 ) -> Result<PacketStream<Active, PrintCodec>> {
-    let mut cap = Capture::from_device("any")
+    let mut cap = Capture::from_device(interface.device)
         .wrap_err("Failed to find device 'any'")?
         .immediate_mode(true)
         .open()
@@ -177,7 +284,7 @@ fn capture_stream(
         .setnonblock()
         .wrap_err("Failed to set nonblocking")?;
     let linktype = cap.get_datalink();
-    cap.filter(format!("udp and port {}", port).as_str(), true)
+    cap.filter(format!("udp and port {}", interface.port).as_str(), true)
         .wrap_err("Failed to create BPF filter")?;
     cap.stream(PrintCodec {
         map,
@@ -187,8 +294,52 @@ fn capture_stream(
     .wrap_err("Failed to create stream")
 }
 
+#[cfg(not(windows))]
 async fn capture_packets(mut stream: PacketStream<Active, PrintCodec>) {
     while stream.next().await.is_some() {}
+}
+
+#[cfg(windows)]
+fn capture_interface(
+    interface: Interface,
+    map: Arc<Mutex<HashMap<u16, OrigPacket>>>,
+    opts: Opts,
+) -> Result<()> {
+    let mut cap = pcap::Capture::from_device(interface.device)
+        .wrap_err("Failed to find the interface")?
+        .immediate_mode(true)
+        .open()
+        .wrap_err("Failed to start.")?;
+
+    cap.filter(format!("udp and port {}", interface.port).as_str(), true)
+        .expect("Failed to create BPF filter");
+
+    let mut decoder = PrintCodec {
+        map,
+        linktype: cap.get_datalink(),
+        opts,
+    };
+
+    while let Ok(packet) = cap.next() {
+        decoder.decode_packet(packet)?
+    }
+
+    Ok(())
+}
+
+fn list_all_interfaces() -> Result<()> {
+    let empty_str = "".to_string();
+
+    let interfaces =
+        pcap::Device::list().wrap_err("Encounter error while listing interfaces on your device")?;
+    println!("{:55} {}", "Interface Name", "Interface Description");
+    interfaces.iter().for_each(|it| {
+        let name = &it.name;
+        let desc = it.desc.as_ref().unwrap_or(&empty_str);
+        println!("{:55} {}", name, desc);
+    });
+
+    Ok(())
 }
 
 pub struct PrintCodec {
@@ -197,10 +348,8 @@ pub struct PrintCodec {
     opts: Opts,
 }
 
-impl PacketCodec for PrintCodec {
-    type Type = ();
-
-    fn decode(&mut self, packet: Packet) -> Result<(), pcap::Error> {
+impl PrintCodec {
+    pub fn decode_packet(&mut self, packet: Packet) -> Result<(), pcap::Error> {
         let mut map = self.map.lock().unwrap();
         let map_clone = self.map.clone();
         let opts_clone = self.opts.clone();
@@ -230,9 +379,18 @@ impl PacketCodec for PrintCodec {
     }
 }
 
+#[cfg(not(windows))]
+impl PacketCodec for PrintCodec {
+    type Type = ();
+
+    fn decode(&mut self, packet: Packet) -> Result<(), pcap::Error> {
+        self.decode_packet(packet)
+    }
+}
+
 fn get_time(packet: &Packet) -> DateTime<Utc> {
     let packet_time = packet.header.ts;
-    let micros = ((packet_time.tv_sec * 1000000) as u64) + (packet_time.tv_usec as u64);
+    let micros = (packet_time.tv_sec as u64 * 1000000) + (packet_time.tv_usec as u64);
     DateTime::<Utc>::from(time::UNIX_EPOCH + time::Duration::from_micros(micros))
 }
 

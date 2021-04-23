@@ -19,10 +19,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             asset_name: dnspeep-linux.tar.gz
+            features: pcap_unix
           - name: macos
             target: x86_64-apple-darwin
             os: macos-latest
             asset_name: dnspeep-macos.tar.gz
+            features: pcap_unix
     steps:
     - uses: actions/checkout@v1
 
@@ -58,7 +60,7 @@ jobs:
         rustup target add ${{ matrix.target }}
 
     - name: Build
-      run: cargo build --release --locked --target ${{ matrix.target }}
+      run: cargo build --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
 
     - name: Create release tarball
       run: tar -C target/${{matrix.target}}/release/ -czf ${{ matrix.asset_name }} dnspeep 
