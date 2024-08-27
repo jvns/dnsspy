@@ -52,6 +52,6 @@ prints them out with the response `<no response>`.
 
 ### Limitations
 
-* Only supports the DNS query types supported by the `dns_parser` crate ([here's a list](https://docs.rs/dns-parser/0.8.0/dns_parser/))
+* Only supports the DNS query types supported by the `dns-message-parser` crate ([here's a list](https://docs.rs/dns-message-parser/0.6.0/dns_message_parser/rr/enum.RR.html))
 * Doesn't support TCP DNS queries, only UDP
 * It can't show DNS-over-HTTPS queries (because it would need to MITM the HTTPS connection)
