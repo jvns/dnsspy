@@ -10,7 +10,7 @@ use futures::StreamExt;
 use getopts::Options;
 use hex::encode;
 use pcap::stream::{PacketCodec, PacketStream};
-use pcap::{Active, Capture, Linktype, Packet};
+use pcap::{Active, Capture, Device, Linktype, Packet};
 use std::collections::HashMap;
 use std::env;
 use std::net::IpAddr;
@@ -35,6 +35,7 @@ struct OrigPacket {
 struct Opts {
     source: Source,
     timestamp: bool,
+    nic: String,
 }
 
 #[derive(Clone)]
@@ -97,6 +98,7 @@ fn parse_args() -> Result<Opts> {
 
     let mut opts = Options::new();
     opts.optopt("p", "port", "port number to listen on", "PORT");
+    opts.optopt("i", "interface", "network interface to listen on", "NIC");
     opts.optopt("f", "file", "read packets from pcap file", "FILENAME");
     opts.optflag(
         "t",
@@ -117,7 +119,12 @@ fn parse_args() -> Result<Opts> {
     let mut opts = Opts {
         source: Source::Port(53),
         timestamp: matches.opt_present("t"),
+        nic: "any".to_string(),
     };
+
+    if let Some(nic) = matches.opt_str("i") {
+        opts.nic = nic.to_string();
+    }
 
     if let Some(filename) = matches.opt_str("f") {
         opts.source = Source::Filename(filename.to_string());
@@ -167,8 +174,13 @@ fn capture_stream(
     map: Arc<Mutex<HashMap<u16, OrigPacket>>>,
     port: u16,
 ) -> Result<PacketStream<Active, PrintCodec>> {
-    let mut cap = Capture::from_device("any")
-        .wrap_err("Failed to find device 'any'")?
+    let _nic = Device {
+        name: opts.nic.clone(),
+        desc: std::option::Option::None,
+    };
+    let wrap_err_msg = format!("Failed to find device '{}'", opts.nic);
+    let mut cap = Capture::from_device(_nic)
+        .wrap_err(wrap_err_msg)?
         .immediate_mode(true)
         .open()
         .wrap_err("Failed to start. This may be because you need to run this as root.")?
