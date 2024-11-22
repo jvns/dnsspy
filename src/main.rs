@@ -147,6 +147,9 @@ What the output columns mean:
    response:  Responses from the Answer section of the DNS response (or \"<no response>\" if none was found).
               Multiple responses are separated by commas.
 ");
+    println!("
+Your are running version v0.1.4.
+");
 }
 
 fn capture_file(opts: &Opts, filename: &str) -> Result<()> {
